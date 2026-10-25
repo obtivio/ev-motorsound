@@ -166,6 +166,7 @@ details.help p{margin:8px 0 0;max-width:70ch}
       </div>
       <button type="button" class="toggle" id="sportBtn" aria-pressed="false"><span>Sport-Modus</span><span class="sw"></span></button>
       <label class="vol" for="vol"><span>Lautstärke</span><input type="range" id="vol" min="0" max="100" value="85"><output id="volOut">85</output></label>
+      <label class="vol" for="dyn" title="Wie stark Beschleunigung in Last und Drehzahl übersetzt wird"><span>Dynamik</span><input type="range" id="dyn" min="50" max="200" value="120"><output id="dynOut">1.2×</output></label>
       <button type="button" class="start" id="startBtn" data-on="false">Start</button>
     </div>
 
@@ -182,7 +183,7 @@ details.help p{margin:8px 0 0;max-width:70ch}
         <li>Lautstärke des Browsers über den Tesla-Lautstärkeregler, Feinabstimmung hier.</li>
         <li>Tab im Vordergrund lassen; ein Browser im Hintergrund kann Audio und GPS pausieren.</li>
       </ol>
-      <p>Die Last (Gasfuß) wird aus der Beschleunigung geschätzt, bezogen auf das, was ein Model 3 Performance bei diesem Tempo kann; die Demo fährt mit derselben Physik (0–100 in gut 3 s, 261 km/h). Die Drehzahl kommt aus einem virtuellen Automatikgetriebe. Im Stand kannst du mit <b>Rev</b> aufdrehen. Falls der Tesla-Browser kein GPS liefert, geht es am Handy per Bluetooth-Audio. Bedienung nur im Stand, der Ton bleibt im Innenraum.</p>
+      <p>Die Last (Gasfuß) wird aus der Beschleunigung geschätzt, bezogen auf das, was ein Model 3 Performance bei diesem Tempo kann; die Demo fährt mit derselben Physik (0–100 in gut 3 s, 261 km/h). Die Drehzahl kommt aus einem virtuellen Automatikgetriebe: Lange Vollgas-Phasen drehen die Gänge aus, konstantes Fahren schaltet hoch, erneutes Gasgeben löst einen Kickdown aus. <b>Dynamik</b> regelt, wie stark Beschleunigung in Last und Drehzahl übersetzt wird. Im Stand kannst du mit <b>Rev</b> aufdrehen. Falls der Tesla-Browser kein GPS liefert, geht es am Handy per Bluetooth-Audio. Bedienung nur im Stand, der Ton bleibt im Innenraum.</p>
     </details>
   </aside>
 </main>
@@ -200,7 +201,7 @@ class EngineCore {
     this.boost = 0; this.tPhase = 0; this.hiss = 0; this.hissLp = 0;
     this.popEnv = 0; this.popLp = 0; this.popsPending = 0; this.popTimer = 0;
     this.ph = new Float64Array(8); this.nLp = 0; this.lfo = 0;
-    this.tick = 0; this.tickLp = 0;
+    this.tick = 0; this.tickLp = 0; this.indLp = 0;
     this.seed = 22222;
   }
   rnd() { this.seed = (Math.imul(this.seed, 1664525) + 1013904223) >>> 0; return this.seed / 4294967296; }
@@ -264,7 +265,7 @@ class EngineCore {
           const tb = thr * Math.min(1, rpm / 4200);
           this.boost += (tb - this.boost) * (tb > this.boost ? 0.00004 : 0.0004);
           this.tPhase += (700 + this.boost * 3800) / sr; if (this.tPhase >= 1) this.tPhase -= 1;
-          mono += Math.sin(TAU * this.tPhase) * this.boost * 0.045 * p.turbo;
+          mono += Math.sin(TAU * this.tPhase) * this.boost * 0.07 * p.turbo;
           if (this.hiss > 0.001) {
             const nz = this.rnd() * 2 - 1;
             this.hissLp += (nz - this.hissLp) * 0.5;
@@ -300,8 +301,12 @@ class EngineCore {
             this.tick *= 0.985;
           }
         }
+        // induction roar: only under load, brighter with rpm
+        { const nz = this.rnd() * 2 - 1; this.indLp += (nz - this.indLp) * (0.04 + rn * 0.3);
+          mono += this.indLp * thr * thr * (0.08 + rn * 0.14); }
         l += mono; r += mono;
-        l = Math.tanh(l * p.drive); r = Math.tanh(r * p.drive);
+        const drive = p.drive * (0.75 + 0.5 * thr), loud = 0.55 + 0.45 * thr;   // load: more bite, more level
+        l = Math.tanh(l * drive) * loud; r = Math.tanh(r * drive) * loud;
       } else if (p.kind === 'ev') {
         const f1 = 30 + rn * 1500;
         const ph = this.ph;
@@ -391,11 +396,11 @@ const PROFILES = [
 /* ====================== App state ====================== */
 const $ = id => document.getElementById(id);
 const S = {
-  running: false, mode: 'demo', sport: false, volume: 0.85,
+  running: false, mode: 'demo', sport: false, volume: 0.85, dyn: 1.2,
   profile: PROFILES[0],
   speed: 0, tSpeed: 0, accelS: 0,        // m/s, m/s, m/s²
   thr: 0, rawThr: 0, rawPrev: 0,
-  gear: 0, rpm: 850, shiftT: 0, sinceShift: 9, blipT: 0,
+  gear: 0, rpm: 850, shiftT: 0, sinceShift: 9, blipT: 0, loadInt: 0, cruiseT: 0,
   gas: false, brake: false,
   gpsWatch: null, lastFix: null, fixAt: 0,
   audioKind: '', lastT: 0,
@@ -405,8 +410,9 @@ try { const s = JSON.parse(localStorage.getItem('evms.settings') || '{}');
   if (typeof s.volume === 'number') S.volume = s.volume;
   if (s.mode === 'gps' || s.mode === 'demo') S.mode = s.mode;
   if (typeof s.sport === 'boolean') S.sport = s.sport;
+  if (typeof s.dyn === 'number' && s.dyn >= 0.5 && s.dyn <= 2) S.dyn = s.dyn;
 } catch (e) {}
-function save() { try { localStorage.setItem('evms.settings', JSON.stringify({ profile: S.profile.id, volume: S.volume, mode: S.mode, sport: S.sport })); } catch (e) {} }
+function save() { try { localStorage.setItem('evms.settings', JSON.stringify({ profile: S.profile.id, volume: S.volume, mode: S.mode, sport: S.sport, dyn: S.dyn })); } catch (e) {} }
 
 /* ====================== Audio graph ====================== */
 const A = { ctx: null, node: null, core: null, port: null, tone: null, master: null, meter: null, meterBuf: null, wake: null };
@@ -525,24 +531,31 @@ function stepModel(dt) {
     const v = S.speed;
     let a = (S.gas ? aMax(v) : -CAR.regen) - aDrag(v) - (S.brake ? 8 : 0);   // off the pedal: one-pedal regen
     if (v >= CAR.vmax && a > 0) a = 0;
+    if (v <= 0 && a < 0) a = 0;
     S.speed = Math.max(0, v + a * dt);
+    S.accelS += (a - S.accelS) * Math.min(1, dt * 6);
     S.rawThr = S.gas ? 1 : 0;
   } else {
-    S.speed += (S.tSpeed - S.speed) * Math.min(1, dt * 2.2);
+    // dead-reckon between fixes: last fix + measured acceleration, fading out if fixes stop
+    const age = S.fixAt ? (Date.now() - S.fixAt) / 1000 : 99;
+    if (age > 2.5) S.accelS *= Math.max(0, 1 - dt * 0.8);
+    if (age > 6 && S.gpsWatch !== null) S.tSpeed *= Math.max(0, 1 - dt * 0.3);
+    const predicted = Math.max(0, S.tSpeed + S.accelS * Math.min(age, 1.5));
+    S.speed += (predicted - S.speed) * Math.min(1, dt * 4);
     const kmh = S.speed * 3.6;
-    // load = measured acceleration relative to what the car can do at this speed
-    let est = 0.06 + 0.22 * Math.min(1, kmh / 200) + Math.max(0, S.accelS) / aMax(S.speed) * (S.sport ? 1.0 : 0.85);
-    if (S.accelS < -0.35) est = 0;
+    // load = measured acceleration relative to what the car can do at this speed, scaled by the Dynamik setting
+    let est = 0.06 + 0.22 * Math.min(1, kmh / 200) + Math.max(0, S.accelS) / aMax(S.speed) * (S.sport ? 1.0 : 0.85) * S.dyn;
+    if (S.accelS < -0.3) est = 0;
     if (S.speed < 0.5) est = 0;
     if (S.gas) est = 1;                         // Rev button
     S.rawThr = Math.max(0, Math.min(1, est));
-    if (Date.now() - S.fixAt > 6000 && S.gpsWatch !== null) { S.tSpeed *= Math.max(0, 1 - dt * 0.3); }
   }
   if (S.rawPrev > 0.5 && S.rawThr < 0.2) sendLift();
   S.rawPrev = S.rawThr;
   S.thr += (S.rawThr - S.thr) * Math.min(1, dt * (S.rawThr > S.thr ? 9 : 5));
 
-  const kmh = S.speed * 3.6;
+  // look ahead: the engine note rises while the car is accelerating, not a second later
+  const kmh = Math.max(0, S.speed + Math.max(0, S.accelS) * 0.6 * S.dyn) * 3.6;
   let effThr = S.thr, rpmT;
   if (p.kind !== 'ice') {
     S.gear = -1;
@@ -558,17 +571,32 @@ function stepModel(dt) {
       const d = rpmT - S.rpm; const mx = rate * dt;
       S.rpm += Math.abs(d) < mx ? d : Math.sign(d) * mx;
     } else {
-      if (S.gear <= 0) { S.gear = 1; S.sinceShift = 9; }
+      if (S.gear <= 0) { S.gear = 1; S.sinceShift = 9; S.loadInt = 0; S.cruiseT = 0; }
       const g = S.gear;
-      rpmT = Math.max(idle * 1.1, Math.min(red * 1.03, kmh / tops[g - 1] * red));
+      const rpmIn = gg => kmh / tops[gg - 1] * red;
+      rpmT = Math.max(idle * 1.1, Math.min(red * 1.03, rpmIn(g)));
+      // drive demand = current load plus a slow memory of sustained load (long pulls get held to the limiter)
+      S.loadInt += (S.thr - S.loadInt) * Math.min(1, dt * (S.thr > S.loadInt ? 0.7 : 0.35));
+      const drive = Math.max(S.thr, S.loadInt);
+      if (Math.abs(S.accelS) < 0.5 && S.thr < 0.35) S.cruiseT += dt; else S.cruiseT = 0;
+      const smooth = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+      const shiftTo = (gg, blip) => { S.gear = gg; S.shiftT = gg > g ? 0.28 : 0.3; S.blipT = blip ? 0.14 : 0; S.sinceShift = 0; if (gg > g && S.thr > 0.5) sendLift(); };
       if (S.shiftT > 0) { S.shiftT -= dt; effThr = S.blipT > 0 ? 1 : 0; S.blipT -= dt; }
-      else if (S.sinceShift > 0.55) {
-        const up = (S.sport ? 3300 : 2600) + S.thr * (red - 300 - (S.sport ? 3300 : 2600));
-        const down = 1400 + S.thr * 2200;
-        if (g < tops.length && rpmT > up && (kmh / tops[g] * red) > idle * 1.3) { S.gear = g + 1; S.shiftT = 0.22; S.sinceShift = 0; }
-        else if (g > 1 && rpmT < down) { S.gear = g - 1; S.shiftT = 0.2; S.blipT = S.sport ? 0.12 : 0; S.sinceShift = 0; }
+      else if (S.sinceShift > 0.5) {
+        const base = S.sport ? 3600 : 2800;
+        const up = base + smooth(0.12, 0.8, drive) * (red - 150 - base);          // hard & sustained → limiter
+        const desired = 3200 + smooth(0.45, 1, S.thr) * (0.78 * red - 3200);      // kickdown target rpm
+        if (g < tops.length && rpmT > up && rpmIn(g + 1) > idle * 1.3) shiftTo(g + 1, false);
+        else if (S.cruiseT > 2.5 && g < tops.length && rpmIn(g + 1) >= 1500) shiftTo(g + 1, false);   // steady cruise → long gear
+        else if (S.thr > 0.45 && rpmT < desired * 0.82) {                                              // back on the gas → kickdown
+          let best = g;
+          for (let gg = g - 1; gg >= 1; gg--) { if (rpmIn(gg) <= red * 0.95) best = gg; else break; }
+          while (best < g && rpmIn(best) > desired * 1.25 && rpmIn(best + 1) >= desired * 0.9) best++;
+          if (best < g) shiftTo(best, true);
+        }
+        else if (g > 1 && rpmT < 1300) shiftTo(g - 1, false);                                          // lugging
       }
-      rpmT = Math.max(idle * 1.1, Math.min(red * 1.03, kmh / tops[S.gear - 1] * red));
+      rpmT = Math.max(idle * 1.1, Math.min(red * 1.03, rpmIn(S.gear)));
       S.rpm += (rpmT - S.rpm) * Math.min(1, dt * (S.shiftT > 0 ? 9 : 12));
     }
   }
@@ -672,8 +700,8 @@ function onFix(pos) {
     v = Math.min(100, v);
     if (S.lastFix && S.lastFix.v !== null) {
       const dtF = Math.max(0.2, (t - S.lastFix.t) / 1000);
-      const a = (v - S.lastFix.v) / dtF;
-      S.accelS = S.accelS * 0.45 + a * 0.55;
+      const a = Math.max(-12, Math.min(12, (v - S.lastFix.v) / dtF));
+      S.accelS = S.accelS * 0.3 + a * 0.7;
     }
     S.tSpeed = v;
   }
@@ -744,6 +772,8 @@ $('fsBtn').addEventListener('click', async () => {
 });
 document.addEventListener('fullscreenchange', () => { $('fsBtn').textContent = document.fullscreenElement ? 'Vollbild aus' : 'Vollbild'; });
 
+$('dyn').addEventListener('input', e => { S.dyn = e.target.value / 100; $('dynOut').textContent = S.dyn.toFixed(1) + '×'; save(); });
+$('dyn').value = Math.round(S.dyn * 100); $('dynOut').textContent = S.dyn.toFixed(1) + '×';
 $('vol').value = Math.round(S.volume * 100); $('volOut').textContent = Math.round(S.volume * 100);
 $('sportBtn').setAttribute('aria-pressed', String(S.sport));
 document.documentElement.dataset.family = S.profile.family;

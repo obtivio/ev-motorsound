@@ -635,20 +635,25 @@ function setMode(m) {
   $('brakeBtn').hidden = gps; $('pedals').classList.toggle('single', gps);
   $('gasBtn').innerHTML = gps ? 'Rev<small>im Stand halten</small>' : 'Gas<small>halten</small>';
   S.gas = false; S.brake = false; S.speed = 0; S.tSpeed = 0; S.accelS = 0;
-  if (S.running) { if (gps) startGps(); else stopGps(); }
-  if (!gps) gpsStatus('', 'GPS aus');
+  if (gps) startGps(); else { stopGps(); gpsStatus('', 'GPS aus'); }
 }
 
 /* ====================== GPS ====================== */
+let gpsSilenceTimer = null;
 function startGps() {
   if (S.gpsWatch !== null) return;
-  if (!('geolocation' in navigator)) { gpsStatus('bad', 'Kein GPS in diesem Browser'); return; }
-  gpsStatus('warn', 'GPS: warte auf Signal…');
+  if (!window.isSecureContext) { gpsStatus('bad', 'Standort nur über https möglich'); return; }
+  if (!('geolocation' in navigator)) { gpsStatus('bad', 'Dieser Browser hat keine Standortfunktion'); return; }
+  gpsStatus('warn', 'Standortfreigabe anfragen… (bitte „Erlauben“)');
+  S.fixAt = 0;
   try {
     S.gpsWatch = navigator.geolocation.watchPosition(onFix, onGpsErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
-  } catch (e) { S.gpsWatch = null; gpsStatus('bad', 'GPS nicht verfügbar'); }
+  } catch (e) { S.gpsWatch = null; gpsStatus('bad', 'Standort nicht verfügbar: ' + e.message); return; }
+  clearTimeout(gpsSilenceTimer);
+  gpsSilenceTimer = setTimeout(() => { if (S.gpsWatch !== null && !S.fixAt) gpsStatus('warn', 'Keine Antwort vom Browser – Standortfreigabe in den Browser-Einstellungen prüfen, dann hier tippen'); }, 20000);
 }
-function stopGps() { if (S.gpsWatch !== null) { try { navigator.geolocation.clearWatch(S.gpsWatch); } catch (e) {} S.gpsWatch = null; } }
+function stopGps() { clearTimeout(gpsSilenceTimer); if (S.gpsWatch !== null) { try { navigator.geolocation.clearWatch(S.gpsWatch); } catch (e) {} S.gpsWatch = null; } }
+function retryGps() { if (S.mode !== 'gps') return; stopGps(); S.lastFix = null; startGps(); }
 function onFix(pos) {
   const c = pos.coords, t = pos.timestamp || Date.now();
   let v = null;
@@ -677,10 +682,15 @@ function onFix(pos) {
   gpsStatus(c.accuracy < 30 ? 'ok' : 'warn', `GPS ±${Math.round(c.accuracy)} m`);
 }
 function onGpsErr(err) {
-  if (err && err.code === 1) gpsStatus('bad', 'GPS verweigert oder hier nicht erlaubt – Demo nutzen');
-  else if (err && err.code === 3) gpsStatus('warn', 'GPS: noch kein Signal');
-  else gpsStatus('bad', 'GPS-Fehler');
+  const code = err && err.code;
+  if (code === 1) gpsStatus('bad', 'Standort verweigert – im Browser erlauben (Schloss-Symbol / Website-Einstellungen), dann hier tippen');
+  else if (code === 2) gpsStatus('bad', 'Position nicht verfügbar – GPS-Empfang? Hier tippen für neuen Versuch');
+  else if (code === 3) gpsStatus('warn', 'GPS: noch kein Signal, warte weiter…');
+  else gpsStatus('bad', 'Standort-Fehler' + (err && err.message ? ': ' + err.message : '') + ' – hier tippen für neuen Versuch');
 }
+$('gpsPill').addEventListener('click', retryGps);
+$('gpsPill').style.cursor = 'pointer';
+$('gpsPill').title = 'Antippen: Standort erneut anfragen';
 
 /* ====================== Start / Stop ====================== */
 async function start() {
@@ -697,10 +707,9 @@ async function start() {
 }
 function stop() {
   S.running = false; S.gas = false; S.brake = false; S.speed = 0; S.tSpeed = 0;
-  stopGps();
   if (A.ctx) A.ctx.suspend();
   try { if (A.wake) { A.wake.release(); A.wake = null; } } catch (e) {}
-  audioStatus('', 'Audio aus'); if (S.mode === 'gps') gpsStatus('', 'GPS aus');
+  audioStatus('', 'Audio aus');
   $('startBtn').textContent = 'Start'; $('startBtn').dataset.on = 'false';
   S.rpm = S.profile.idle; S.gear = 0; S.effThr = 0; render();
 }
